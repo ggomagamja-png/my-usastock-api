@@ -1,4 +1,7 @@
 fastapi
 uvicorn
-requests
-beautifulsoup4
+yfinance
+pykrx
+pandas
+lxml
+
