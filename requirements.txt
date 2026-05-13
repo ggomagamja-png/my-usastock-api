@@ -4,5 +4,4 @@ requests
 beautifulsoup4
 pykrx
 pandas
-decimal
 lxml
