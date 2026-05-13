@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from pykrx import stock
 from datetime import datetime, timedelta
 import uvicorn
+import re
 
 app = FastAPI()
 
@@ -16,41 +17,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_naver_global_price(symbol: str):
-    """해외 주식: 검색 API로 정확한 심볼을 찾은 후 크롤링"""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'}
+def get_google_finance_price(symbol: str):
+    """구글 파이낸스를 통해 해외 주식 현재가 추출"""
+    # 구글 파이낸스 검색 URL (예: AAPL 주식 검색)
+    url = f"https://www.google.com/search?q=google+finance+{symbol}"
     
-    try:
-        # 1. 네이버 검색 API를 통해 정확한 심볼(예: AAPL -> AAPL.O) 검색
-        # 이 단계가 있어야 네이버 상세 페이지 URL을 정확히 맞출 수 있습니다.
-        search_url = f"https://ac.finance.naver.com/ac?q={symbol}&q_enc=utf-8&st=1&frm=stock&r_format=json"
-        search_res = requests.get(search_url, timeout=5).json()
-        items = search_res.get('items', [[]])[0]
-        
-        target_symbol = symbol.upper() # 기본값
-        for item in items:
-            if item[4] == '2': # 해외 주식 타입인 경우
-                target_symbol = item[1] # 네이버 전용 심볼(AAPL.O 등) 추출
-                break
+    # 봇 차단 방지를 위한 브라우저 헤더 설정
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
 
-        # 2. 추출된 심볼로 상세 페이지 크롤링
-        url = f"https://finance.naver.com/world/sise.naver?symbol={target_symbol}"
-        res = requests.get(url, headers=headers, timeout=5)
-        soup = BeautifulSoup(res.text, 'html.parser')
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-        price_tag = soup.select_one(".no_today .blind")
-        if price_tag:
-            price_str = price_tag.text.strip().replace(",", "")
-            if price_str.replace(".", "").isdigit():
-                return Decimal(price_str), target_symbol
-                
+        # 구글 파이낸스 위젯에서 가격 데이터가 들어있는 클래스 탐색
+        # 구글은 클래스명이 자주 바뀌지만, 'data-precision' 속성이나 특정 패턴을 가짐
+        # 현재 가장 안정적으로 가격을 추출하는 CSS 선택자:
+        price_tag = soup.find("span", {"data-precision": True}) or soup.select_one(".fx96Cc .YMlS7e") or soup.select_one(".I67m4c")
+        
+        if not price_tag:
+            # 대체 방법: 텍스트 내에서 $ 뒤에 오는 숫자 패턴 찾기
+            text_content = soup.get_text()
+            match = re.search(r'\$(\d{1,3}(?:,\d{3})*(?:\.\d+))', text_content)
+            if match:
+                price_str = match.group(1).replace(",", "")
+                return Decimal(price_str)
+            return None
+
+        # 가격 문자열 정제
+        price_str = price_tag.text.replace("$", "").replace(",", "").strip()
+        return Decimal(price_str)
+        
     except Exception as e:
-        print(f"Scraping Error: {e}")
-    return None, None
+        print(f"Google Finance Error: {e}")
+        return None
 
 @app.get("/search/{query}")
 async def search_stock(query: str):
-    """종목 검색 기능"""
+    """네이버 API를 활용한 종목 검색 (가장 안정적)"""
     try:
         url = f"https://ac.finance.naver.com/ac?q={query}&q_enc=utf-8&st=1&frm=stock&r_format=json"
         res = requests.get(url, timeout=5)
@@ -58,14 +66,14 @@ async def search_stock(query: str):
         items = data.get('items', [[]])[0]
         results = [{"name": item[0], "symbol": item[1], "type": "KR" if item[4] == '1' else "US/Global"} for item in items]
         return {"items": results}
-    except Exception as e:
-        return {"items": [], "error": str(e)}
+    except:
+        return {"items": []}
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
-    """가격 조회 (6자리 숫자: KRX, 그 외: 네이버 해외 크롤링)"""
+    """국내(6자리): pykrx / 해외: Google Finance"""
     try:
-        # [국내 주식] 6자리 숫자
+        # 1. 국내 주식 (6자리 숫자)
         if symbol.isdigit() and len(symbol) == 6:
             today = datetime.now().strftime("%Y%m%d")
             df = stock.get_market_ohlcv(today, today, symbol)
@@ -83,19 +91,19 @@ async def get_price(symbol: str):
                     "currency": "KRW"
                 }
 
-        # [해외 주식] 그 외 모든 케이스
+        # 2. 해외 주식 (그 외)
         else:
-            price_dec, real_symbol = get_naver_global_price(symbol)
+            price_dec = get_google_finance_price(symbol.upper())
             if price_dec:
                 formatted_price = price_dec.quantize(Decimal('0.0000'), rounding=ROUND_HALF_UP)
                 return {
-                    "symbol": real_symbol, # 네이버 실제 심볼 반환 (예: AAPL.O)
+                    "symbol": symbol.upper(),
                     "market": "US/Global",
                     "price": str(formatted_price),
                     "currency": "USD"
                 }
             
-        raise HTTPException(status_code=404, detail="종목 정보를 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="종목을 찾을 수 없습니다.")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
