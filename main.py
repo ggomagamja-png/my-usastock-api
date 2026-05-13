@@ -1,59 +1,60 @@
-import requests
-from bs4 import BeautifulSoup
-from fastapi import FastAPI, Query
-import os
-import re
+from fastapi import FastAPI, HTTPException
+from decimal import Decimal, ROUND_HALF_UP
+import yfinance as yf
+from pykrx import stock
+from datetime import datetime
+import uvicorn
 
 app = FastAPI()
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
-}
+def to_decimal(value):
+    """모든 입력을 정밀 계산 가능한 Decimal로 변환"""
+    return Decimal(str(value))
 
-@app.get("/")
-def home():
-    return {"status": "ok"}
-
-@app.get("/stock")
-def get_stock_data(name: str = Query(None)):
-    if not name:
-        return {"name": None, "price": "0"}
-
+@app.get("/price/{symbol}")
+def get_stock_data(symbol: str):
     try:
-        # 네이버 검색 결과 페이지 가져오기
-        url = f"https://search.naver.com/search.naver?query={name}+주가"
-        res = requests.get(url, headers=HEADERS, timeout=5)
-        html = res.text
-        soup = BeautifulSoup(html, 'html.parser')
-
-        # 가격 정보 추출 (여러 영역 통합 검색)
-        price = "0"
-        price_candidates = soup.select(".price_info strong, .s0p_nm, .n_price strong, .api_biz_stock_price")
-        
-        if price_candidates:
-            # 숫자만 추출
-            price = re.sub(r'[^0-9]', '', price_candidates[0].text)
-        else:
-            # 태그 실패 시 정규식으로 '현재가' 키워드 주변 숫자 검색
-            match = re.search(r'현재가.*?([0-9,]{3,10})', html)
-            if match:
-                price = match.group(1).replace(",", "")
-
-        # 최종 결과 반환
-        if price == "0":
-            return {"name": name, "price": "데이터없음"}
+        # 1. 국내 주식 (6자리 숫자인 경우)
+        if symbol.isdigit() and len(symbol) == 6:
+            today = datetime.now().strftime("%Y%m%d")
+            # KRX에서 당일 종가 가져오기
+            df = stock.get_market_ohlcv(today, today, symbol)
             
-        return {
-            "name": name,
-            "price": price
-        }
+            if df.empty:
+                # 장 시작 전이거나 휴일일 경우 최근 영업일 데이터 호출
+                df = stock.get_market_ohlcv("20240101", today, symbol)
+            
+            if not df.empty:
+                price = to_decimal(df['종가'].iloc[-1])
+                return {
+                    "symbol": symbol,
+                    "market": "KOSPI/KOSDAQ",
+                    "price": str(price.quantize(Decimal('1'))), # 국내는 소수점 없음
+                    "currency": "KRW"
+                }
+
+        # 2. 해외 주식 (티커 입력 시)
+        else:
+            ticker = yf.Ticker(symbol)
+            # info에서 현재가 추출
+            raw_price = ticker.info.get('currentPrice') or ticker.info.get('regularMarketPrice')
+            
+            if raw_price:
+                price_dec = to_decimal(raw_price)
+                # 소수점 4자리까지 고정 (계산용 데이터)
+                precise_price = price_dec.quantize(Decimal('0.0000'), rounding=ROUND_HALF_UP)
+                
+                return {
+                    "symbol": symbol.upper(),
+                    "market": "US/Global",
+                    "price": str(precise_price), # JSON 전달을 위해 문자열 변환
+                    "currency": "USD"
+                }
+
+        raise HTTPException(status_code=404, detail="종목을 찾을 수 없습니다.")
 
     except Exception as e:
-        return {"name": name, "price": "에러", "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    import uvicorn
-    # Render 등 클라우드 환경의 PORT 환경변수 대응
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
