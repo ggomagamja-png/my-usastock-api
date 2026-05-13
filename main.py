@@ -1,14 +1,14 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from decimal import Decimal, ROUND_HALF_UP
-import yfinance as yf
+import requests
+from bs4 import BeautifulSoup
 from pykrx import stock
+from datetime import datetime
 import uvicorn
-import asyncio
 
 app = FastAPI()
 
-# CORS 설정: 브라우저에서 API를 호출할 때 발생하는 보안 차단 방지
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,92 +16,96 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 글로벌 캐시 변수
-KRX_CACHE = []
-
-@app.on_event("startup")
-async def load_krx_data():
-    """서버 시작 시 국내 종목 리스트를 메모리에 로드 (매번 리스트 훑기 방지)"""
-    global KRX_CACHE
-    print("🚀 국내 종목 리스트 로드 중...")
+def get_naver_global_price(symbol: str):
+    """해외 주식만 네이버 증권에서 가격 추출"""
+    # 1. 네이버 검색 API를 통해 해외 종목의 정확한 내부 심볼(예: AAPL.O)을 찾음
+    search_url = f"https://ac.finance.naver.com/ac?q={symbol}&q_enc=utf-8&st=1&frm=stock&r_format=json"
     try:
-        # 코스피, 코스닥 종목 리스트를 한 번에 가져와 메모리에 저장
-        combined_list = []
-        for market in ["KOSPI", "KOSDAQ"]:
-            tickers = stock.get_market_ticker_list(market=market)
-            for t in tickers:
-                name = stock.get_market_ticker_name(t)
-                combined_list.append({
-                    "name": name,
-                    "symbol": t,
-                    "market": market,
-                    "type": "KR"
-                })
-        KRX_CACHE = combined_list
-        print(f"✅ 로드 완료: {len(KRX_CACHE)} 종목 저장됨.")
+        search_res = requests.get(search_url).json()
+        items = search_res.get('items', [[]])[0]
+        
+        # 해외 종목(type '2') 중 첫 번째 결과 사용
+        target_symbol = None
+        for item in items:
+            if item[4] == '2': 
+                target_symbol = item[1]
+                break
+        
+        if not target_symbol:
+            target_symbol = symbol # 검색 결과 없으면 입력값 그대로 시도
+
+        # 2. 네이버 해외 주식 페이지 크롤링
+        url = f"https://finance.naver.com/world/sise.naver?symbol={target_symbol}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # 현재가 추출
+        price_tag = soup.select_one(".no_today .blind")
+        if price_tag:
+            price_str = price_tag.text.replace(",", "")
+            return Decimal(price_str)
     except Exception as e:
-        print(f"❌ 로드 실패: {e}")
+        print(f"Naver Scraping Error: {e}")
+    return None
 
 @app.get("/search/{query}")
 async def search_stock(query: str):
-    """국내/해외 종목 검색 (메모리 캐시 + yfinance)"""
-    # 1. 국내 주식 검색 (메모리에서 즉각 필터링)
-    kr_results = [item for item in KRX_CACHE if query.lower() in item['name'].lower()]
-    
-    # 2. 해외 주식 검색 (yfinance Search API 활용)
-    us_results = []
+    """네이버 API 통합 검색 (국내/해외 코드 찾기용)"""
     try:
-        # yfinance 검색은 별도 스레드에서 실행되도록 loop 활용 (FastAPI 권장)
-        loop = asyncio.get_event_loop()
-        yf_search = await loop.run_in_executor(None, lambda: yf.Search(query, max_results=5))
-        
-        for quote in yf_search.quotes:
-            us_results.append({
-                "name": quote.get("longname") or quote.get("shortname"),
-                "symbol": quote.get("symbol"),
-                "market": quote.get("exchange"),
-                "type": "US/Global"
+        url = f"https://ac.finance.naver.com/ac?q={query}&q_enc=utf-8&st=1&frm=stock&r_format=json"
+        data = requests.get(url).json()
+        items = data.get('items', [[]])[0]
+        results = []
+        for item in items:
+            results.append({
+                "name": item[0],
+                "symbol": item[1],
+                "type": "KR" if item[4] == '1' else "US/Global"
             })
-    except Exception:
-        pass
-
-    return {
-        "query": query,
-        "total": len(kr_results) + len(us_results),
-        "items": kr_results + us_results
-    }
+        return {"items": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/price/{symbol}")
-async def get_stock_price(symbol: str):
-    """종목 코드 또는 티커로 현재가 조회 (소수점 4자리 정밀 계산)"""
+async def get_price(symbol: str):
     try:
-        # 국내 주식 (6자리 숫자)
+        # 1. 국내 주식 (6자리 숫자) -> pykrx 사용
         if symbol.isdigit() and len(symbol) == 6:
-            # pykrx는 동기 방식이므로 마지막 종가를 가져옴
-            price_raw = stock.get_market_ohlcv_by_date(None, None, symbol)['종가'].iloc[-1]
-            price_dec = Decimal(str(price_raw))
-            return {
-                "symbol": symbol,
-                "price": str(price_dec.quantize(Decimal('1'))), # 원화는 정수
-                "currency": "KRW"
-            }
-
-        # 해외 주식 (티커)
-        else:
-            ticker = yf.Ticker(symbol)
-            # info 호출 시 발생할 수 있는 딜레이를 위해 currentPrice 우선 확인
-            info = ticker.info
-            raw_price = info.get('currentPrice') or info.get('regularMarketPrice')
+            today = datetime.now().strftime("%Y%m%d")
+            df = stock.get_market_ohlcv(today, today, symbol)
             
-            if raw_price:
-                price_dec = Decimal(str(raw_price)).quantize(Decimal('0.0000'), rounding=ROUND_HALF_UP)
+            # 장 시작 전이거나 휴일이면 최근 영업일 데이터 호출
+            if df.empty:
+                # 최근 7일 내의 데이터를 가져옴
+                from datetime import timedelta
+                start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
+                df = stock.get_market_ohlcv(start_date, today, symbol)
+            
+            if not df.empty:
+                price_raw = df['종가'].iloc[-1]
+                price_dec = Decimal(str(price_raw))
+                return {
+                    "symbol": symbol,
+                    "market": "KRX",
+                    "price": str(price_dec.quantize(Decimal('1'))),
+                    "currency": "KRW"
+                }
+
+        # 2. 해외 주식 (그 외) -> 네이버 크롤링 사용
+        else:
+            price_dec = get_naver_global_price(symbol.upper())
+            if price_dec:
+                # 해외 주식은 소수점 4자리 고정
+                precise_price = price_dec.quantize(Decimal('0.0000'), rounding=ROUND_HALF_UP)
                 return {
                     "symbol": symbol.upper(),
-                    "price": str(price_dec),
+                    "market": "US/Global",
+                    "price": str(precise_price),
                     "currency": "USD"
                 }
-            
-            raise HTTPException(status_code=404, detail="종목을 찾을 수 없습니다.")
+
+        raise HTTPException(status_code=404, detail="종목 정보를 찾을 수 없습니다.")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
