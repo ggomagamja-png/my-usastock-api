@@ -1,12 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from decimal import Decimal, ROUND_HALF_UP
-import requests
-from bs4 import BeautifulSoup
+import yfinance as yf
 from pykrx import stock
 from datetime import datetime, timedelta
 import uvicorn
-import re
+import requests
 
 app = FastAPI()
 
@@ -17,48 +16,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_google_finance_price(symbol: str):
-    """구글 파이낸스를 통해 해외 주식 현재가 추출"""
-    # 구글 파이낸스 검색 URL (예: AAPL 주식 검색)
-    url = f"https://www.google.com/search?q=google+finance+{symbol}"
-    
-    # 봇 차단 방지를 위한 브라우저 헤더 설정
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # 구글 파이낸스 위젯에서 가격 데이터가 들어있는 클래스 탐색
-        # 구글은 클래스명이 자주 바뀌지만, 'data-precision' 속성이나 특정 패턴을 가짐
-        # 현재 가장 안정적으로 가격을 추출하는 CSS 선택자:
-        price_tag = soup.find("span", {"data-precision": True}) or soup.select_one(".fx96Cc .YMlS7e") or soup.select_one(".I67m4c")
-        
-        if not price_tag:
-            # 대체 방법: 텍스트 내에서 $ 뒤에 오는 숫자 패턴 찾기
-            text_content = soup.get_text()
-            match = re.search(r'\$(\d{1,3}(?:,\d{3})*(?:\.\d+))', text_content)
-            if match:
-                price_str = match.group(1).replace(",", "")
-                return Decimal(price_str)
-            return None
-
-        # 가격 문자열 정제
-        price_str = price_tag.text.replace("$", "").replace(",", "").strip()
-        return Decimal(price_str)
-        
-    except Exception as e:
-        print(f"Google Finance Error: {e}")
-        return None
+# yfinance 차단 우회를 위한 세션 설정
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+})
 
 @app.get("/search/{query}")
 async def search_stock(query: str):
-    """네이버 API를 활용한 종목 검색 (가장 안정적)"""
+    """검색은 네이버 API 활용 (가장 빠름)"""
     try:
         url = f"https://ac.finance.naver.com/ac?q={query}&q_enc=utf-8&st=1&frm=stock&r_format=json"
         res = requests.get(url, timeout=5)
@@ -71,7 +37,7 @@ async def search_stock(query: str):
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
-    """국내(6자리): pykrx / 해외: Google Finance"""
+    """국내(6자리): pykrx / 해외: yfinance(세션 우회)"""
     try:
         # 1. 국내 주식 (6자리 숫자)
         if symbol.isdigit() and len(symbol) == 6:
@@ -93,8 +59,20 @@ async def get_price(symbol: str):
 
         # 2. 해외 주식 (그 외)
         else:
-            price_dec = get_google_finance_price(symbol.upper())
-            if price_dec:
+            # 세션을 사용하여 차단 우회
+            ticker = yf.Ticker(symbol.upper(), session=session)
+            
+            # fast_info는 차단에 더 강하고 빠릅니다
+            price_raw = None
+            try:
+                price_raw = ticker.fast_info['last_price']
+            except:
+                # fast_info 실패 시 기본 info 시도
+                info = ticker.info
+                price_raw = info.get('currentPrice') or info.get('regularMarketPrice')
+
+            if price_raw:
+                price_dec = Decimal(str(price_raw))
                 formatted_price = price_dec.quantize(Decimal('0.0000'), rounding=ROUND_HALF_UP)
                 return {
                     "symbol": symbol.upper(),
@@ -103,9 +81,10 @@ async def get_price(symbol: str):
                     "currency": "USD"
                 }
             
-        raise HTTPException(status_code=404, detail="종목을 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="종목 정보를 가져올 수 없습니다.")
 
     except Exception as e:
+        print(f"Error for {symbol}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
