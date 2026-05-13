@@ -4,7 +4,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import requests
 from bs4 import BeautifulSoup
 from pykrx import stock
-from datetime import datetime
+from datetime import datetime, timedelta
 import uvicorn
 
 app = FastAPI()
@@ -17,96 +17,83 @@ app.add_middleware(
 )
 
 def get_naver_global_price(symbol: str):
-    """해외 주식만 네이버 증권에서 가격 추출"""
-    # 1. 네이버 검색 API를 통해 해외 종목의 정확한 내부 심볼(예: AAPL.O)을 찾음
-    search_url = f"https://ac.finance.naver.com/ac?q={symbol}&q_enc=utf-8&st=1&frm=stock&r_format=json"
-    try:
-        search_res = requests.get(search_url).json()
-        items = search_res.get('items', [[]])[0]
+    """해외 주식 가격 추출 (DNS 에러 방지를 위한 직접 접근 방식)"""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'}
+    
+    # 네이버 해외 주식은 티커 뒤에 시장 구분값(.O, .N, .AM)이 붙어야 합니다.
+    # 사용자가 'AAPL'만 입력했을 경우를 대비해 주요 시장 접미사를 순회하며 시도합니다.
+    suffixes = ["", ".O", ".N", ".AM"] 
+    
+    for suffix in suffixes:
+        target = symbol + suffix
+        url = f"https://finance.naver.com/world/sise.naver?symbol={target}"
         
-        # 해외 종목(type '2') 중 첫 번째 결과 사용
-        target_symbol = None
-        for item in items:
-            if item[4] == '2': 
-                target_symbol = item[1]
-                break
-        
-        if not target_symbol:
-            target_symbol = symbol # 검색 결과 없으면 입력값 그대로 시도
-
-        # 2. 네이버 해외 주식 페이지 크롤링
-        url = f"https://finance.naver.com/world/sise.naver?symbol={target_symbol}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        # 현재가 추출
-        price_tag = soup.select_one(".no_today .blind")
-        if price_tag:
-            price_str = price_tag.text.replace(",", "")
-            return Decimal(price_str)
-    except Exception as e:
-        print(f"Naver Scraping Error: {e}")
+        try:
+            res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code != 200:
+                continue
+                
+            soup = BeautifulSoup(res.text, 'html.parser')
+            # 현재가 태그 추출
+            price_tag = soup.select_one(".no_today .blind")
+            
+            if price_tag and price_tag.text.strip():
+                price_str = price_tag.text.replace(",", "")
+                return Decimal(price_str)
+        except Exception as e:
+            print(f"Scraping attempt failed for {target}: {e}")
+            continue
+            
     return None
 
 @app.get("/search/{query}")
 async def search_stock(query: str):
-    """네이버 API 통합 검색 (국내/해외 코드 찾기용)"""
+    """종목 검색 (DNS 에러 발생 시 빈 리스트 반환하여 전체 다운 방지)"""
     try:
         url = f"https://ac.finance.naver.com/ac?q={query}&q_enc=utf-8&st=1&frm=stock&r_format=json"
-        data = requests.get(url).json()
+        res = requests.get(url, timeout=3)
+        data = res.json()
         items = data.get('items', [[]])[0]
-        results = []
-        for item in items:
-            results.append({
-                "name": item[0],
-                "symbol": item[1],
-                "type": "KR" if item[4] == '1' else "US/Global"
-            })
+        results = [{"name": item[0], "symbol": item[1], "type": "KR" if item[4] == '1' else "US/Global"} for item in items]
         return {"items": results}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Search DNS/Connection Error: {e}")
+        # 검색 API가 죽어도 전체 서비스는 동작하도록 빈 결과 반환
+        return {"items": [], "error": "Search service temporarily unavailable"}
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
     try:
-        # 1. 국내 주식 (6자리 숫자) -> pykrx 사용
+        # 1. 국내 주식 (6자리 숫자)
         if symbol.isdigit() and len(symbol) == 6:
             today = datetime.now().strftime("%Y%m%d")
             df = stock.get_market_ohlcv(today, today, symbol)
             
-            # 장 시작 전이거나 휴일이면 최근 영업일 데이터 호출
             if df.empty:
-                # 최근 7일 내의 데이터를 가져옴
-                from datetime import timedelta
                 start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
                 df = stock.get_market_ohlcv(start_date, today, symbol)
             
             if not df.empty:
                 price_raw = df['종가'].iloc[-1]
-                price_dec = Decimal(str(price_raw))
                 return {
                     "symbol": symbol,
                     "market": "KRX",
-                    "price": str(price_dec.quantize(Decimal('1'))),
+                    "price": str(Decimal(str(price_raw)).quantize(Decimal('1'))),
                     "currency": "KRW"
                 }
 
-        # 2. 해외 주식 (그 외) -> 네이버 크롤링 사용
+        # 2. 해외 주식 (그 외)
         else:
             price_dec = get_naver_global_price(symbol.upper())
             if price_dec:
-                # 해외 주식은 소수점 4자리 고정
-                precise_price = price_dec.quantize(Decimal('0.0000'), rounding=ROUND_HALF_UP)
                 return {
                     "symbol": symbol.upper(),
                     "market": "US/Global",
-                    "price": str(precise_price),
+                    "price": str(price_dec.quantize(Decimal('0.0000'), ROUND_HALF_UP)),
                     "currency": "USD"
                 }
 
-        raise HTTPException(status_code=404, detail="종목 정보를 찾을 수 없습니다.")
-
+        raise HTTPException(status_code=404, detail="Symbol not found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
