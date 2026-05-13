@@ -2,5 +2,6 @@ fastapi
 uvicorn
 requests
 pykrx
-yfinance>=0.2.38
 pandas
+yfinance>=0.2.40
+curl_cffi
