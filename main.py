@@ -6,7 +6,6 @@ from bs4 import BeautifulSoup
 from pykrx import stock
 from datetime import datetime, timedelta
 import uvicorn
-import traceback
 
 app = FastAPI()
 
@@ -18,104 +17,88 @@ app.add_middleware(
 )
 
 def get_naver_global_price(symbol: str):
-    """해외 주식 전용: 네이버 증권 크롤링"""
+    """해외 주식: 검색 API로 정확한 심볼을 찾은 후 크롤링"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'}
     
-    # 네이버 해외 주식 시장 구분 접미사 순차 시도
-    suffixes = ["", ".O", ".N", ".AM"] 
-    
-    for suffix in suffixes:
-        target = symbol.upper() + suffix
-        url = f"https://finance.naver.com/world/sise.naver?symbol={target}"
+    try:
+        # 1. 네이버 검색 API를 통해 정확한 심볼(예: AAPL -> AAPL.O) 검색
+        # 이 단계가 있어야 네이버 상세 페이지 URL을 정확히 맞출 수 있습니다.
+        search_url = f"https://ac.finance.naver.com/ac?q={symbol}&q_enc=utf-8&st=1&frm=stock&r_format=json"
+        search_res = requests.get(search_url, timeout=5).json()
+        items = search_res.get('items', [[]])[0]
         
-        try:
-            res = requests.get(url, headers=headers, timeout=5)
-            if res.status_code != 200:
-                continue
+        target_symbol = symbol.upper() # 기본값
+        for item in items:
+            if item[4] == '2': # 해외 주식 타입인 경우
+                target_symbol = item[1] # 네이버 전용 심볼(AAPL.O 등) 추출
+                break
+
+        # 2. 추출된 심볼로 상세 페이지 크롤링
+        url = f"https://finance.naver.com/world/sise.naver?symbol={target_symbol}"
+        res = requests.get(url, headers=headers, timeout=5)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        price_tag = soup.select_one(".no_today .blind")
+        if price_tag:
+            price_str = price_tag.text.strip().replace(",", "")
+            if price_str.replace(".", "").isdigit():
+                return Decimal(price_str), target_symbol
                 
-            soup = BeautifulSoup(res.text, 'html.parser')
-            price_tag = soup.select_one(".no_today .blind")
-            
-            if price_tag and price_tag.text.strip():
-                price_str = price_tag.text.strip().replace(",", "")
-                # 소수점 포함 숫자 여부 확인 후 Decimal 변환
-                if price_str.replace(".", "").isdigit():
-                    return Decimal(price_str)
-        except:
-            continue
-    return None
+    except Exception as e:
+        print(f"Scraping Error: {e}")
+    return None, None
 
 @app.get("/search/{query}")
 async def search_stock(query: str):
-    """네이버 API 통합 검색 (국내 6자리, 해외 티커 찾기용)"""
+    """종목 검색 기능"""
     try:
         url = f"https://ac.finance.naver.com/ac?q={query}&q_enc=utf-8&st=1&frm=stock&r_format=json"
         res = requests.get(url, timeout=5)
         data = res.json()
         items = data.get('items', [[]])[0]
-        # 검색 결과 가공
-        results = []
-        for item in items:
-            results.append({
-                "name": item[0],
-                "symbol": item[1],
-                "type": "KR" if item[4] == '1' else "US/Global"
-            })
+        results = [{"name": item[0], "symbol": item[1], "type": "KR" if item[4] == '1' else "US/Global"} for item in items]
         return {"items": results}
     except Exception as e:
         return {"items": [], "error": str(e)}
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
-    """가격 조회: 6자리 숫자는 KRX, 그 외는 해외 네이버 크롤링"""
+    """가격 조회 (6자리 숫자: KRX, 그 외: 네이버 해외 크롤링)"""
     try:
-        # --- [CASE 1] 국내 주식: 종목 코드가 6자리 숫자인 경우 ---
+        # [국내 주식] 6자리 숫자
         if symbol.isdigit() and len(symbol) == 6:
-            try:
-                today = datetime.now().strftime("%Y%m%d")
-                # pykrx 데이터 호출
-                df = stock.get_market_ohlcv(today, today, symbol)
-                
-                # 오늘 데이터 없으면(휴일/장전) 최근 7일치 뒤지기
-                if df is None or df.empty:
-                    start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
-                    df = stock.get_market_ohlcv(start_date, today, symbol)
-                
-                if df is not None and not df.empty:
-                    price_raw = df['종가'].iloc[-1]
-                    return {
-                        "symbol": symbol,
-                        "market": "KRX",
-                        "price": str(int(price_raw)),
-                        "currency": "KRW"
-                    }
-                else:
-                    raise HTTPException(status_code=404, detail="KRX 종목 정보를 찾을 수 없습니다.")
-            except Exception as e:
-                print(f"KRX Error: {e}")
-                raise HTTPException(status_code=500, detail=f"KRX API 오류: {str(e)}")
+            today = datetime.now().strftime("%Y%m%d")
+            df = stock.get_market_ohlcv(today, today, symbol)
+            
+            if df is None or df.empty:
+                start_date = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
+                df = stock.get_market_ohlcv(start_date, today, symbol)
+            
+            if df is not None and not df.empty:
+                price_raw = df['종가'].iloc[-1]
+                return {
+                    "symbol": symbol,
+                    "market": "KRX",
+                    "price": str(int(price_raw)),
+                    "currency": "KRW"
+                }
 
-        # --- [CASE 2] 해외 주식: 6자리 숫자가 아닌 모든 경우 (티커 등) ---
+        # [해외 주식] 그 외 모든 케이스
         else:
-            price_dec = get_naver_global_price(symbol)
-            if price_dec is not None:
-                # 소수점 4자리 반올림
+            price_dec, real_symbol = get_naver_global_price(symbol)
+            if price_dec:
                 formatted_price = price_dec.quantize(Decimal('0.0000'), rounding=ROUND_HALF_UP)
                 return {
-                    "symbol": symbol.upper(),
+                    "symbol": real_symbol, # 네이버 실제 심볼 반환 (예: AAPL.O)
                     "market": "US/Global",
                     "price": str(formatted_price),
                     "currency": "USD"
                 }
-            else:
-                raise HTTPException(status_code=404, detail="해외 종목 정보를 찾을 수 없습니다.")
+            
+        raise HTTPException(status_code=404, detail="종목 정보를 찾을 수 없습니다.")
 
-    except HTTPException as he:
-        raise he
     except Exception as e:
-        # 상세 에러 로그 출력 (Render Logs 확인용)
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
