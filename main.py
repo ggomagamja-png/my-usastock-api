@@ -1,41 +1,59 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 import requests
 from bs4 import BeautifulSoup
+from fastapi import FastAPI, Query
+import os
+import re
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-STOCK_CODES = {
-    "현대차": "005380",
-    "삼성전자": "005930",
-    "카카오": "035720",
-    "네이버": "035420"
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
 }
 
-@app.get("/api/stock/{stock_name}")
-def get_stock_info(stock_name: str):
-    if stock_name not in STOCK_CODES:
-        return {"error": "종목을 찾을 수 없습니다."}
-    
-    code = STOCK_CODES[stock_name]
-    url = f"https://finance.naver.com/item/main.naver?code={code}"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    
+@app.get("/")
+def home():
+    return {"status": "ok"}
+
+@app.get("/stock")
+def get_stock_data(name: str = Query(None)):
+    if not name:
+        return {"name": None, "price": "0"}
+
     try:
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        price_tag = soup.select_one('.no_today .blind')
+        # 네이버 검색 결과 페이지 가져오기
+        url = f"https://search.naver.com/search.naver?query={name}+주가"
+        res = requests.get(url, headers=HEADERS, timeout=5)
+        html = res.text
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # 가격 정보 추출 (여러 영역 통합 검색)
+        price = "0"
+        price_candidates = soup.select(".price_info strong, .s0p_nm, .n_price strong, .api_biz_stock_price")
         
-        if price_tag:
-            return {"name": stock_name, "code": code, "price": price_tag.text}
+        if price_candidates:
+            # 숫자만 추출
+            price = re.sub(r'[^0-9]', '', price_candidates[0].text)
         else:
-            return {"error": "가격을 불러올 수 없습니다."}
+            # 태그 실패 시 정규식으로 '현재가' 키워드 주변 숫자 검색
+            match = re.search(r'현재가.*?([0-9,]{3,10})', html)
+            if match:
+                price = match.group(1).replace(",", "")
+
+        # 최종 결과 반환
+        if price == "0":
+            return {"name": name, "price": "데이터없음"}
+            
+        return {
+            "name": name,
+            "price": price
+        }
+
     except Exception as e:
-        return {"error": "크롤링 실패"}
+        return {"name": name, "price": "에러", "error": str(e)}
+
+if __name__ == "__main__":
+    import uvicorn
+    # Render 등 클라우드 환경의 PORT 환경변수 대응
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
