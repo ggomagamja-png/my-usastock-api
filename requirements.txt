@@ -1,7 +1,8 @@
 fastapi
 uvicorn
-yfinance
+yfinance>=0.2.38
 pykrx
 pandas
 lxml
+
 
