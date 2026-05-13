@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 import uvicorn
 import requests
 
-
 app = FastAPI()
 
 app.add_middleware(
@@ -16,12 +15,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# yfinance 차단 우회를 위한 세션 설정
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-})
 
 @app.get("/search/{query}")
 async def search_stock(query: str):
@@ -38,7 +31,7 @@ async def search_stock(query: str):
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
-    """국내(6자리): pykrx / 해외: yfinance(세션 우회)"""
+    """국내(6자리): pykrx / 해외: yfinance"""
     try:
         # 1. 국내 주식 (6자리 숫자)
         if symbol.isdigit() and len(symbol) == 6:
@@ -60,15 +53,15 @@ async def get_price(symbol: str):
 
         # 2. 해외 주식 (그 외)
         else:
-            # 세션을 사용하여 차단 우회
-            ticker = yf.Ticker(symbol.upper(), session=session)
+            # 세션을 직접 넘기지 않고 yfinance 내부 로직에 맡김
+            ticker = yf.Ticker(symbol.upper())
             
-            # fast_info는 차단에 더 강하고 빠릅니다
+            # fast_info를 먼저 시도 (가장 빠르고 차단에 강함)
             price_raw = None
             try:
                 price_raw = ticker.fast_info['last_price']
             except:
-                # fast_info 실패 시 기본 info 시도
+                # info 시도
                 info = ticker.info
                 price_raw = info.get('currentPrice') or info.get('regularMarketPrice')
 
