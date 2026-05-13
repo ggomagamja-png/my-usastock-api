@@ -1,7 +1,6 @@
 fastapi
 uvicorn
 requests
-beautifulsoup4
 pykrx
+yfinance>=0.2.38
 pandas
-lxml
